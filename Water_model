@@ -117,13 +117,17 @@ write.csv(
 )
 
 # =========================================================
-# 本番データ用：複数地点一括パラメータ最適化（安定版）
+# 3年分データ（SMC_3years）パラメータ最適化 実行コード
 # =========================================================
 
-# 1. 安定版のパラメータ推定関数を定義
+# 1. 念のため日付型を確実に統一
+df_weather$date <- as.Date(df_weather$date)
+SMC_3years$date <- as.Date(SMC_3years$date)
+
+# 2. 安定版最適化関数の定義
 estimate_parameters_stable <- function(df_weather, df_obs_smc, 
                                        fixed_a = 0.5, fixed_AWHC = 40.0,
-                                       init_params = c(Sd = 200, SMC0 = 0.15)) {
+                                       init_params = c(Sd = 200, SMC0 = 0.05)) {
   
   objective_func <- function(params) {
     Sd   <- params[1]
@@ -152,62 +156,53 @@ estimate_parameters_stable <- function(df_weather, df_obs_smc,
   return(opt)
 }
 
-
-# 2. 全地点ループ処理の実行
-# ※ 整形したデータフレーム名を df_obs_all と仮定しています
-sites <- unique(df_obs_all$site)
-
-results_list <- list()
+# 3. 全地点一括最適化ループ
+sites <- unique(SMC_3years$site)
 summary_params <- data.frame()
 
-# 固定値設定 (a=0.5, AWHC=40)
-fixed_a    <- 0.5
-fixed_AWHC <- 40.0
-
-cat("解析を開始します（全", length(sites), "地点）...\n")
+cat("全", length(sites), "地点の最適化計算を実行中...\n")
 
 for (s in sites) {
-  # 該当地点の抽出
-  df_obs_site <- subset(df_obs_all, site == s)
+  df_obs_site <- subset(SMC_3years, site == s)
   
-  # 最適化の実行
   opt_out <- estimate_parameters_stable(
     df_weather  = df_weather, 
     df_obs_smc  = df_obs_site,
-    fixed_a     = fixed_a,
-    fixed_AWHC  = fixed_AWHC,
-    init_params = c(Sd = 200, SMC0 = 0.05) # 初期値を少し低めに設定
+    fixed_a     = 0.5,
+    fixed_AWHC  = 40.0,
+    init_params = c(Sd = 200, SMC0 = 0.05)
   )
   
   pars <- opt_out$par
-  
-  # 結果の保存
   summary_params <- rbind(summary_params, data.frame(
     site = s,
-    a    = fixed_a,
-    AWHC = fixed_AWHC,
+    a    = 0.5,
+    AWHC = 40.0,
     Sd   = pars["Sd"],
     SMC0 = pars["SMC0"],
     SSR  = opt_out$value
   ))
-  
-  # 最適値でのシミュレーション結果を作成
-  sim_site <- simulate_water(df_weather, a = fixed_a, AWHC = fixed_AWHC)
-  sim_site$SMC_pred <- calc_SMC(sim_site$Aw, Sd = pars["Sd"], SMC0 = pars["SMC0"])
-  sim_site$site <- s
-  
-  results_list[[s]] <- sim_site
 }
 
-# 3. 推定された地点別パラメータ一覧の表示
-print("【地点別 最適化パラメータ結果一覧】")
-print(head(summary_params, 10)) # 先頭10地点を表示
+# 4. 推定された地点別パラメータ一覧の表示
+print("【3年分一括：地点別 最適化パラメータ結果一覧】")
+print(head(summary_params, 10))
+
+# 5. CSV保存
+write.csv(
+  summary_params, 
+  "C:/Users/koike/OneDrive/Desktop/Water/optimization_results_3years.csv", 
+  row.names = FALSE, 
+  fileEncoding = "CP932"
+)
+
+cat("\n🎉 最適化が正常に完了し、CSVに結果を保存しました！\n")
 
 # =========================================================
 # 2025年 栽培期間（6/1〜9/30）の土壌水分 推定処理
 # =========================================================
 
-# 1. 2025年通年の気象データを抽出
+# 1. 2025年栽培期間の気象データを抽出（日付型を明示して安全に抽出）
 df_weather_2025_full <- subset(
   df_weather, 
   date >= as.Date("2025-06-01") & date <= as.Date("2025-09-30")
@@ -217,42 +212,134 @@ df_weather_2025_full <- subset(
 df_pred_2025_all <- data.frame()
 
 # 3. 全地点ループで全日推定を実行
+cat("2025年栽培期間（6/1〜9/30）の全日土壌水分量を推定中...\n")
+
 for (s in sites) {
   # 地点ごとの最適化パラメータを取得
   pars_target <- subset(summary_params, site == s)
   
-  # 2025年通年で水収支シミュレーションを実行
-  sim_full <- simulate_water(
-    df_weather_2025_full, 
-    a    = pars_target$a, 
-    AWHC = pars_target$AWHC
-  )
-  
-  # SMC（体積含水率）を計算
-  sim_full$SMC_pred <- calc_SMC(
-    sim_full$Aw, 
-    Sd   = pars_target$Sd, 
-    SMC0 = pars_target$SMC0
-  )
-  
-  # 地点IDを列として追加
-  sim_full$site <- s
-  
-  # 結果を結合 (必要な列だけ選択: date, site, rain, et_p, SMC_pred)
-  sim_sub <- sim_full[, c("date", "site", "rain", "et_p", "SMC_pred")]
-  df_pred_2025_all <- rbind(df_pred_2025_all, sim_sub)
+  # 該当パラメータが存在する場合のみ実行
+  if (nrow(pars_target) > 0) {
+    # 2025年栽培期間で水収支シミュレーションを実行
+    sim_full <- simulate_water(
+      df_weather_2025_full, 
+      a    = pars_target$a, 
+      AWHC = pars_target$AWHC
+    )
+    
+    # SMC（体積含水率）を計算
+    sim_full$SMC_pred <- calc_SMC(
+      sim_full$Aw, 
+      Sd   = pars_target$Sd, 
+      SMC0 = pars_target$SMC0
+    )
+    
+    # 地点IDを列として追加
+    sim_full$site <- s
+    
+    # 必要な列（date, site, rain, et_p, SMC_pred）だけ抽出して結合
+    sim_sub <- sim_full[, c("date", "site", "rain", "et_p", "SMC_pred")]
+    df_pred_2025_all <- rbind(df_pred_2025_all, sim_sub)
+  }
 }
 
 # --- 4. 結果の確認 ---
-head(df_pred_2025_all)
+print("【2025年栽培期間 推定結果（先頭6行）】")
+print(head(df_pred_2025_all))
 
-# --- 5. 2025年全日の推定結果をCSVファイルに保存 ---
+# --- 5. 推定結果をデスクトップの Water フォルダにCSV保存 ---
+save_path <- "C:/Users/koike/OneDrive/Desktop/Water/soil_moisture_pred_2025_full.csv"
+
 write.csv(
   df_pred_2025_all, 
-  file = "C:/Users/koike/Downloads/soil_moisture_pred_2025_full.csv", 
+  file = save_path, 
   row.names = FALSE, 
   fileEncoding = "CP932"
 )
 
-cat("2025年栽培期間の推定結果を保存しました！\n")
+cat("\n🎉 2025年栽培期間の推定結果を以下のパスに保存しました！\n")
+cat(save_path, "\n")
 
+# =========================================================
+# 2023〜2025年 適合度（再現精度）の評価処理
+# =========================================================
+
+# 1. 精度評価指標を計算する関数の定義
+calc_metrics <- function(obs, pred) {
+  valid <- complete.cases(obs, pred)
+  obs   <- obs[valid]
+  pred  <- pred[valid]
+  
+  if (length(obs) == 0) return(c(RMSE = NA, MAE = NA, R2 = NA, NSE = NA))
+  
+  rmse <- sqrt(mean((obs - pred)^2))
+  mae  <- mean(abs(obs - pred))
+  
+  # 分散が 0 の場合の判定
+  r2   <- ifelse(sd(obs) > 0 && sd(pred) > 0, cor(obs, pred)^2, NA)
+  
+  denom_nse <- sum((obs - mean(obs))^2)
+  nse  <- ifelse(denom_nse > 0, 1 - (sum((obs - pred)^2) / denom_nse), NA)
+  
+  return(c(RMSE = rmse, MAE = mae, R2 = r2, NSE = nse))
+}
+
+# 2. 地点ごとの精度評価結果を格納するデータフレーム
+eval_results <- data.frame()
+merged_all_sites <- data.frame()
+
+cat("2023〜2025年の適合度評価を計算中...\n")
+
+for (s in sites) {
+  # 該当地点の実測データとパラメータを取得
+  df_obs_site  <- subset(SMC_3years, site == s)
+  pars_target  <- subset(summary_params, site == s)
+  
+  if (nrow(pars_target) > 0 && nrow(df_obs_site) > 0) {
+    # 推定値を計算
+    sim_res <- simulate_water(df_weather, a = pars_target$a, AWHC = pars_target$AWHC)
+    sim_res$SMC_pred <- calc_SMC(sim_res$Aw, Sd = pars_target$Sd, SMC0 = pars_target$SMC0)
+    
+    # 実測値と推定値を日付で結合
+    merged <- merge(df_obs_site, sim_res, by = "date")
+    
+    if (nrow(merged) > 0) {
+      # 指標計算 (SMC_obs と SMC_pred を比較)
+      metrics <- calc_metrics(merged$SMC_obs, merged$SMC_pred)
+      
+      # 地点別結果を追加
+      eval_results <- rbind(eval_results, data.frame(
+        site  = s,
+        N     = nrow(merged), # サンプル数
+        RMSE  = round(metrics["RMSE"], 4),
+        MAE   = round(metrics["MAE"], 4),
+        R2    = round(metrics["R2"], 3),
+        NSE   = round(metrics["NSE"], 3)
+      ))
+      
+      merged$site <- s
+      merged_all_sites <- rbind(merged_all_sites, merged)
+    }
+  }
+}
+
+# --- 3. 結果の表示 ---
+print("【地点別 適合度評価結果（先頭10地点）】")
+print(head(eval_results, 10))
+
+# --- 4. 全地点平均の精度表示 ---
+cat("\n【2023〜2025年 全地点平均の再現精度】\n")
+cat(" 平均 RMSE : ", round(mean(eval_results$RMSE, na.rm=TRUE), 4), " (体積含水率の平均誤差)\n")
+cat(" 平均 MAE  : ", round(mean(eval_results$MAE, na.rm=TRUE), 4), "\n")
+cat(" 平均 R2   : ", round(mean(eval_results$R2, na.rm=TRUE), 3), "\n")
+cat(" 平均 NSE  : ", round(mean(eval_results$NSE, na.rm=TRUE), 3), "\n")
+
+# --- 5. 評価結果のCSV保存 ---
+write.csv(
+  eval_results, 
+  "C:/Users/koike/OneDrive/Desktop/Water/evaluation_2023_2025.csv", 
+  row.names = FALSE, 
+  fileEncoding = "CP932"
+)
+
+cat("\n評価結果を 'evaluation_2023_2025.csv' に保存しました！\n")
