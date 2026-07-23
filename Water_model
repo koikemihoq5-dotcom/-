@@ -1,0 +1,258 @@
+#CSVデータの読み込み
+View(data)
+data_raw <- read.csv(
++     "C:/Users/koike/Downloads/data.csv",
++     fileEncoding = "CP932",
++     header = TRUE,
++     stringsAsFactors = FALSE
++ )
+
+# 中身の確認（最初の数行を表示）
+head(data_raw)
+
+# =========================================================
+# アメダスデータ (data_raw) から df_weather を作成する処理
+# =========================================================
+
+# 1. 全天日射量 (GSR: MJ/m2/day) を推定する関数
+calc_solar_rad <- function(doy, lat_deg, sunshine_hours) {
+  phi <- lat_deg * pi / 180
+  dr  <- 1 + 0.033 * cos(2 * pi * doy / 365)
+  delta <- 0.409 * sin(2 * pi * doy / 365 - 1.39)
+  
+  ws <- acos(-tan(phi) * tan(delta))
+  Gsc <- 0.0820
+  Ra  <- (24 * 60 / pi) * Gsc * dr * (ws * sin(phi) * sin(delta) + cos(phi) * cos(delta) * sin(ws))
+  
+  N <- (24 / pi) * ws
+  n_N <- sunshine_hours / N
+  n_N <- pmin(pmax(n_N, 0), 1)  # 0〜1の範囲に収める
+  
+  Rs <- Ra * (0.25 + 0.50 * n_N)
+  return(Rs)
+}
+
+# 2. データの整形と ETp 計算
+# ※ 仙台周辺を想定して緯度 lat_deg = 38.26 としています（観測地に合わせて変更可）
+lat_deg <- 38.26 
+
+df_weather <- data_raw
+
+# 日付形式の変換と通算日(doy)の作成
+df_weather$date <- as.Date(df_weather$Date, format = "%Y/%m/%d")
+df_weather$doy  <- as.numeric(format(df_weather$date, "%j"))
+
+# 日照時間(Sun)から全天日射量(GSR)を推定
+df_weather$GSR <- calc_solar_rad(
+  doy            = df_weather$doy,
+  lat_deg        = lat_deg,
+  sunshine_hours = df_weather$Sun
+)
+
+# 気温(Temp)から飽和水蒸気圧曲線の斜率 s (kPa/℃) を計算
+df_weather$s <- 4098 * (0.6108 * exp((17.27 * df_weather$Temp) / (df_weather$Temp + 237.3))) / 
+                ((df_weather$Temp + 237.3)^2)
+
+# 純放射量 Rn (mm/day) の算出 (GSRの約60%と仮定し水当量換算)
+df_weather$Rn_mm <- (df_weather$GSR * 0.6) / 2.45
+
+# Priestley-Taylor 式による ETp 計算
+gamma <- 0.066
+df_weather$et_p <- 1.26 * (df_weather$s / (df_weather$s + gamma)) * df_weather$Rn_mm
+
+# モデルに必要な列（date, rain, et_p）だけに絞り込み
+df_weather <- df_weather[, c("date", "Rain", "et_p")]
+colnames(df_weather) <- c("date", "rain", "et_p")
+
+# --- 結果の確認 ---
+head(df_weather)
+
+# =========================================================
+# 実測データ2025Water.csv の整形処理コード
+# =========================================================
+
+# パッケージの読み込み（初回のみ install.packages("tidyverse") が必要な場合があります）
+library(tidyr)
+library(dplyr)
+
+# 1. CSVファイルの読み込み
+# ※ ファイルのパスは実際の保存先に合わせて変更してください
+raw_df <- read.csv(
+  "C:/Users/koike/Downloads/2025Water.csv",
+  fileEncoding = "CP932", # または "UTF-8" 
+  stringsAsFactors = FALSE
+)
+
+# 2. 横持ちから縦持ち（ロング型）へ整形 & 単位変換 (% -> m3/m3)
+df_obs_all <- raw_df %>%
+  # vwc_ で始まる日付列を1列にまとめる
+  pivot_longer(
+    cols = starts_with("vwc_"),
+    names_to = "date_str",
+    values_to = "vwc_pct"
+  ) %>%
+  mutate(
+    # "vwc_0630" から "0630" を抽出して Year(2025) と結合 -> "2025-06-30" に変換
+    date_clean = paste0(Year, "-", gsub("vwc_", "", date_str)),
+    date       = as.Date(date_clean, format = "%Y-%m%d"),
+    
+    # %表記 (例: 7.6) を 体積比 (例: 0.076) に変換
+    SMC_obs    = vwc_pct / 100,
+    
+    # name列をそのまま地点名 (site) として使用
+    site       = name
+  ) %>%
+  # モデルに必要な列だけを抽出
+  select(date, site, SMC_obs)
+
+# 3. 整形結果の確認
+head(df_obs_all)
+
+# 整形した実測データをCSVとして保存
+write.csv(
+  df_obs_all, 
+  file = "C:/Users/koike/Downloads/smc_obs_cleaned.csv", 
+  row.names = FALSE,  # 行番号（1, 2, 3...）を出力しない設定
+  fileEncoding = "CP932" # Excelで文字化けせずに開ける設定
+)
+
+# =========================================================
+# 本番データ用：複数地点一括パラメータ最適化（安定版）
+# =========================================================
+
+# 1. 安定版のパラメータ推定関数を定義
+estimate_parameters_stable <- function(df_weather, df_obs_smc, 
+                                       fixed_a = 0.5, fixed_AWHC = 40.0,
+                                       init_params = c(Sd = 200, SMC0 = 0.15)) {
+  
+  objective_func <- function(params) {
+    Sd   <- params[1]
+    SMC0 <- params[2]
+    
+    # 制約条件 (Sd: 50~500mm, SMC0: 0.0~0.4)
+    if (Sd < 50 || Sd > 500 || SMC0 < 0 || SMC0 > 0.4) {
+      return(1e9)
+    }
+    
+    # 水収支シミュレーションの実行
+    sim_res <- simulate_water(df_weather, a = fixed_a, AWHC = fixed_AWHC)
+    sim_res$SMC_pred <- calc_SMC(sim_res$Aw, Sd = Sd, SMC0 = SMC0)
+    
+    # 日付で結合して残差を計算
+    merged <- merge(df_obs_smc, sim_res, by = "date")
+    if (nrow(merged) == 0) return(1e9)
+    
+    # 残差二乗和 (SSR)
+    ssr <- sum((merged$SMC_obs - merged$SMC_pred)^2, na.rm = TRUE)
+    return(ssr)
+  }
+  
+  opt <- optim(par = init_params, fn = objective_func, method = "Nelder-Mead")
+  names(opt$par) <- c("Sd", "SMC0")
+  return(opt)
+}
+
+
+# 2. 全地点ループ処理の実行
+# ※ 整形したデータフレーム名を df_obs_all と仮定しています
+sites <- unique(df_obs_all$site)
+
+results_list <- list()
+summary_params <- data.frame()
+
+# 固定値設定 (a=0.5, AWHC=40)
+fixed_a    <- 0.5
+fixed_AWHC <- 40.0
+
+cat("解析を開始します（全", length(sites), "地点）...\n")
+
+for (s in sites) {
+  # 該当地点の抽出
+  df_obs_site <- subset(df_obs_all, site == s)
+  
+  # 最適化の実行
+  opt_out <- estimate_parameters_stable(
+    df_weather  = df_weather, 
+    df_obs_smc  = df_obs_site,
+    fixed_a     = fixed_a,
+    fixed_AWHC  = fixed_AWHC,
+    init_params = c(Sd = 200, SMC0 = 0.05) # 初期値を少し低めに設定
+  )
+  
+  pars <- opt_out$par
+  
+  # 結果の保存
+  summary_params <- rbind(summary_params, data.frame(
+    site = s,
+    a    = fixed_a,
+    AWHC = fixed_AWHC,
+    Sd   = pars["Sd"],
+    SMC0 = pars["SMC0"],
+    SSR  = opt_out$value
+  ))
+  
+  # 最適値でのシミュレーション結果を作成
+  sim_site <- simulate_water(df_weather, a = fixed_a, AWHC = fixed_AWHC)
+  sim_site$SMC_pred <- calc_SMC(sim_site$Aw, Sd = pars["Sd"], SMC0 = pars["SMC0"])
+  sim_site$site <- s
+  
+  results_list[[s]] <- sim_site
+}
+
+# 3. 推定された地点別パラメータ一覧の表示
+print("【地点別 最適化パラメータ結果一覧】")
+print(head(summary_params, 10)) # 先頭10地点を表示
+
+# =========================================================
+# 2025年 栽培期間（6/1〜9/30）の土壌水分 推定処理
+# =========================================================
+
+# 1. 2025年通年の気象データを抽出
+df_weather_2025_full <- subset(
+  df_weather, 
+  date >= as.Date("2025-06-01") & date <= as.Date("2025-09-30")
+)
+
+# 2. 全地点の2025年全日推定結果を格納するデータフレーム
+df_pred_2025_all <- data.frame()
+
+# 3. 全地点ループで全日推定を実行
+for (s in sites) {
+  # 地点ごとの最適化パラメータを取得
+  pars_target <- subset(summary_params, site == s)
+  
+  # 2025年通年で水収支シミュレーションを実行
+  sim_full <- simulate_water(
+    df_weather_2025_full, 
+    a    = pars_target$a, 
+    AWHC = pars_target$AWHC
+  )
+  
+  # SMC（体積含水率）を計算
+  sim_full$SMC_pred <- calc_SMC(
+    sim_full$Aw, 
+    Sd   = pars_target$Sd, 
+    SMC0 = pars_target$SMC0
+  )
+  
+  # 地点IDを列として追加
+  sim_full$site <- s
+  
+  # 結果を結合 (必要な列だけ選択: date, site, rain, et_p, SMC_pred)
+  sim_sub <- sim_full[, c("date", "site", "rain", "et_p", "SMC_pred")]
+  df_pred_2025_all <- rbind(df_pred_2025_all, sim_sub)
+}
+
+# --- 4. 結果の確認 ---
+head(df_pred_2025_all)
+
+# --- 5. 2025年全日の推定結果をCSVファイルに保存 ---
+write.csv(
+  df_pred_2025_all, 
+  file = "C:/Users/koike/Downloads/soil_moisture_pred_2025_full.csv", 
+  row.names = FALSE, 
+  fileEncoding = "CP932"
+)
+
+cat("2025年栽培期間の推定結果を保存しました！\n")
+
