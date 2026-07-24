@@ -1,0 +1,135 @@
+#全条件（6つの閾値 × 4つの評価指標 × 4つの生育時期 ＝ 計96パターン）の2次多項式回帰を一括計算する
+#結果（$R^2$、調整済み $R^2$、$p$値）のまとめテーブル作成と、全プロットの一括画像保存（PDF/PNG）を行う
+# =========================================================
+# 1. 必要なライブラリの読み込み
+# =========================================================
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# 出力先ディレクトリ
+output_dir <- "C:/Users/koike/OneDrive/Desktop/Water/Use/"
+
+# =========================================================
+# 2. 全96パターンの2次多項式回帰分析を一括計算
+# =========================================================
+threshold_list <- c("SMC_20", "SMC_25", "SMC_30", "SMC_35", "SMC_40", "SMC_45")
+period_list    <- c("1_初期(播種-V2)", "2_中期(V2-V5)", "3_開花(V5-R1)", "4_全期(播種-R1)")
+
+metrics_map <- list(
+  "連続過湿日数"     = "max_cont_wet_days",
+  "合計の過湿日数"   = "total_wet_days",
+  "平均の水分量"     = "mean_smc_all",
+  "過湿の強さ×日数" = "excess_smc_sum"
+)
+
+all_poly_results <- list()
+
+for (th in threshold_list) {
+  for (pr in period_list) {
+    df_sub <- df_all_wetness_summary %>%
+      filter(threshold == th, period == pr)
+    
+    for (metric_label in names(metrics_map)) {
+      col_name <- metrics_map[[metric_label]]
+      
+      valid_data <- df_sub %>% 
+        filter(!is.na(disease) & !is.na(.data[[col_name]]))
+      
+      # データ数不足や分散0のチェック
+      if (nrow(valid_data) < 4 || var(valid_data[[col_name]]) == 0) {
+        r2_val     <- NA_real_
+        adj_r2_val <- NA_real_
+        p_val      <- NA_real_
+        p_poly2    <- NA_real_
+      } else {
+        # 2次多項式回帰
+        formula_obj <- as.formula(paste("disease ~ poly(", col_name, ", 2, raw = TRUE)"))
+        fit <- lm(formula_obj, data = valid_data)
+        f_stat <- summary(fit)$fstatistic
+        
+        r2_val     <- summary(fit)$r.squared
+        adj_r2_val <- summary(fit)$adj.r.squared
+        
+        # モデル全体の p値
+        p_val <- if (!is.null(f_stat)) {
+          pf(f_stat[1], f_stat[2], f_stat[3], lower.tail = FALSE)
+        } else { NA_real_ }
+        
+        # 2次の項の p値
+        coef_mat <- summary(fit)$coefficients
+        p_poly2 <- if (nrow(coef_mat) >= 3) coef_mat[3, 4] else NA_real_
+      }
+      
+      all_poly_results[[length(all_poly_results) + 1]] <- data.frame(
+        閾値        = paste0(gsub("SMC_", "", th), "%"),
+        時期        = pr,
+        評価指標    = metric_label,
+        R2          = round(r2_val, 4),
+        Adjusted_R2 = round(adj_r2_val, 4),
+        Model_p_val = round(p_val, 5),
+        Poly2_p_val = round(p_poly2, 5)
+      )
+    }
+  }
+}
+
+# 全結果を統合して保存
+df_all_poly_summary <- bind_rows(all_poly_results)
+write.csv(df_all_poly_summary, paste0(output_dir, "poly_regression_all_96patterns.csv"), 
+          row.names = FALSE, fileEncoding = "CP932")
+
+cat("\n【計算完了】全96パターンの2次多項式回帰結果を保存しました。\n")
+
+# =========================================================
+# 3. 全パターンのプロット作成（フォントエラー対策適用）
+# =========================================================
+
+df_plot_all <- df_all_wetness_summary %>%
+  pivot_longer(
+    cols = c(max_cont_wet_days, total_wet_days, mean_smc_all, excess_smc_sum),
+    names_to = "metric_code",
+    values_to = "metric_value"
+  ) %>%
+  mutate(
+    metric_label = case_when(
+      metric_code == "max_cont_wet_days" ~ "連続過湿日数",
+      metric_code == "total_wet_days"    ~ "合計の過湿日数",
+      metric_code == "mean_smc_all"      ~ "平均の水分量",
+      metric_code == "excess_smc_sum"    ~ "過湿の強さ×日数"
+    ),
+    metric_label = factor(metric_label, levels = c("連続過湿日数", "合計の過湿日数", "平均の水分量", "過湿の強さ×日数"))
+  )
+
+pdf_file <- paste0(output_dir, "all_poly_plots_by_threshold.pdf")
+
+# ★ PDFデバイスに日本語フォント(Japan1)を割り当ててエラーを回避
+pdf(pdf_file, width = 12, height = 10, family = "Japan1")
+
+for (th in threshold_list) {
+  th_num <- gsub("SMC_", "", th)
+  df_th <- df_plot_all %>% filter(threshold == th)
+  
+  p <- ggplot(df_th, aes(x = metric_value, y = disease)) +
+    geom_point(alpha = 0.6, color = "darkblue", size = 2) +
+    geom_smooth(method = "lm", formula = y ~ poly(x, 2, raw = TRUE), 
+                color = "firebrick", fill = "pink", se = TRUE, linewidth = 0.8) +
+    facet_grid(period ~ metric_label, scales = "free_x") +
+    labs(
+      title = paste0("土壌水分閾値: ", th_num, "% における各指標・時期と病気発生率の2次多項式回帰"),
+      x = "各指標の値",
+      y = "病気発生率 [%]"
+    ) +
+    theme_bw() + # base_family 指定を外してデフォルトフォントを使用
+    theme(
+      strip.background = element_rect(fill = "gray90"),
+      strip.text = element_text(size = 9, face = "bold"),
+      plot.title = element_text(size = 14, face = "bold")
+    )
+  
+  print(p)
+}
+
+dev.off()
+cat("\n【画像出力完了】エラーなく全閾値のプロットをPDFに保存しました:\n", pdf_file, "\n")
+
