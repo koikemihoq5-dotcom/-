@@ -1,0 +1,218 @@
+#土壌水分の閾値を25-45%で検証
+#評価軸を「SMC 20% 以上の連続過湿日数、合計の過湿日数、平均の水分量、過湿の強さと日数の積算
+」の4項目に
+#期間を4時期検討
+# =========================================================
+# 0. パッケージ読み込み & パラメーター設定
+# =========================================================
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+
+# =========================================================
+# 1. ファイルパス設定 & データの読み込み
+# =========================================================
+output_dir <- "C:/Users/koike/OneDrive/Desktop/Water/Use/"
+
+# 各地点の実測SMC値
+SMC_3years <- read.csv(paste0(output_dir, "SMC_3years.csv"), stringsAsFactors = FALSE)
+
+# 水収支モデルで推定したSMC0値とAWHCを格納
+optimization_results_3years <- read.csv(paste0(output_dir, "optimization_results_3years.csv"), stringsAsFactors = FALSE)
+
+# 2023-2025年の栽培期間のSMC予測値
+soil_moisture_pred_3years_6to9 <- read.csv(paste0(output_dir, "soil_moisture_pred_3years_6to9.csv"), stringsAsFactors = FALSE)
+
+# 2025年の各地点の生育ステージ到達予測日 & 病気データ（disease入り）
+crop_stages_predicted <- read.csv(paste0(output_dir, "crop_stages_predicted.csv"), stringsAsFactors = FALSE)
+
+# =========================================================
+# 2. データの前処理
+# =========================================================
+# 2025年の土壌水分予測データの準備
+df_pred_2025 <- soil_moisture_pred_3years_6to9 %>%
+  mutate(date = as.Date(date)) %>%
+  filter(year(date) == 2025)
+
+# ステージデータの日付型変換 & disease の保持
+df_stages <- crop_stages_predicted %>%
+  mutate(
+    pred_seeding_date = as.Date(pred_seeding_date),
+    v2_date           = as.Date(v2_date),
+    v5_date           = as.Date(v5_date),
+    r1_date           = as.Date(r1_date)
+  )
+
+# 検討するSMC閾値のリスト (20%〜45%)
+thresholds <- c(0.20, 0.25, 0.30, 0.35, 0.40, 0.45)
+
+# =========================================================
+# 3. 帯水指標の集計処理（全時期 × 全閾値の一括計算関数）
+# =========================================================
+
+calc_period_wetness <- function(df_sub, th) {
+  if (nrow(df_sub) == 0) {
+    return(data.frame(
+      period_days       = 0,
+      max_cont_wet_days = 0,
+      total_wet_days    = 0,
+      mean_smc_all      = NA_real_,
+      mean_smc_wet      = NA_real_,
+      excess_smc_sum    = 0
+    ))
+  }
+  
+  smc <- df_sub$SMC_pred
+  is_wet <- smc >= th
+  
+  # 1. 最大連続過湿日数
+  rl <- rle(is_wet)
+  max_cont <- if (any(rl$values)) max(rl$lengths[rl$values]) else 0
+  
+  # 2. 合計過湿日数
+  tot_wet <- sum(is_wet, na.rm = TRUE)
+  
+  # 3. 期間全日の平均水分量
+  mean_all <- mean(smc, na.rm = TRUE)
+  
+  # 4. 過湿日（SMC >= 閾値）のみの平均水分量
+  mean_wet <- if (tot_wet > 0) mean(smc[is_wet], na.rm = TRUE) else NA_real_
+  
+  # 5. 過湿の強さと日数の積算（ Sum of (SMC - threshold) ）
+  excess_sum <- sum(pmax(0, smc - th), na.rm = TRUE)
+  
+  data.frame(
+    period_days       = nrow(df_sub),
+    max_cont_wet_days = max_cont,
+    total_wet_days    = tot_wet,
+    mean_smc_all      = mean_all,
+    mean_smc_wet      = mean_wet,
+    excess_smc_sum    = excess_sum
+  )
+}
+
+results_list <- list()
+
+for (th in thresholds) {
+  th_percent <- as.integer(th * 100)
+  
+  df_wetness_th <- df_pred_2025 %>%
+    inner_join(df_stages, by = "site") %>%
+    group_by(site) %>%
+    group_modify(~ {
+      df_site <- .x
+      seeding_d <- df_site$pred_seeding_date[1]
+      v2_d      <- df_site$v2_date[1]
+      v5_d      <- df_site$v5_date[1]
+      r1_d      <- df_site$r1_date[1]
+      disease_v <- if ("disease" %in% names(df_site)) df_site$disease[1] else NA
+      
+      # 時期別の切り出し
+      p_early <- df_site %>% filter(date >= seeding_d & date <= v2_d)
+      p_mid   <- df_site %>% filter(date >= v2_d      & date <= v5_d)
+      p_r1    <- df_site %>% filter(date >= v5_d      & date <= r1_d)
+      p_full  <- df_site %>% filter(date >= seeding_d & date <= r1_d)
+      
+      bind_rows(
+        data.frame(disease = disease_v, period = "1_初期(播種-V2)", calc_period_wetness(p_early, th)),
+        data.frame(disease = disease_v, period = "2_中期(V2-V5)",   calc_period_wetness(p_mid, th)),
+        data.frame(disease = disease_v, period = "3_開花(V5-R1)",   calc_period_wetness(p_r1, th)),
+        data.frame(disease = disease_v, period = "4_全期(播種-R1)",  calc_period_wetness(p_full, th))
+      )
+    }) %>%
+    ungroup() %>%
+    mutate(threshold = paste0("SMC_", th_percent))
+  
+  results_list[[as.character(th_percent)]] <- df_wetness_th
+}
+
+# 全閾値データの結合
+df_all_wetness_summary <- bind_rows(results_list) %>%
+  select(site, disease, threshold, period, period_days, 
+         max_cont_wet_days, total_wet_days, 
+         mean_smc_all, mean_smc_wet, excess_smc_sum)
+
+# プレビュー表示
+head(df_all_wetness_summary, 20)
+
+# =========================================================
+# 4. 計算結果の CSV 保存
+# =========================================================
+file_output <- paste0(output_dir, "soil_wetness_indicators_2025.csv")
+
+write.csv(df_all_wetness_summary, file_output, row.names = FALSE, fileEncoding = "CP932")
+cat("\n【集計完了】過湿指標の一覧データを保存しました:\n", file_output, "\n")
+
+#===========================================================
+#単回帰分析（病気発生率 disease 〜 各過湿指標）を実行し、結果R²とRMSEを一括出力・CSV保存する R コード 
+#===========================================================
+library(dplyr)
+library(tidyr)
+
+# 1. 解析対象を「1_初期(播種-V2)」だけに絞り込む
+df_early <- df_all_wetness_summary %>%
+  filter(period == "1_初期(播種-V2)")
+
+# 評価対象の閾値と指標のマップ定義
+threshold_list <- c("SMC_20", "SMC_25", "SMC_30", "SMC_35", "SMC_40", "SMC_45")
+
+metrics_map <- list(
+  "連続過湿日数"   = "max_cont_wet_days",
+  "合計の過湿日数" = "total_wet_days",
+  "平均の水分量"   = "mean_smc_all",      # 期間全体の平均水分量
+  "過湿の強さ×日数" = "excess_smc_sum"
+)
+
+# 2. 回帰分析（R2 & RMSE）を一括計算するルーチン
+regression_results <- list()
+
+for (th in threshold_list) {
+  df_sub <- df_early %>% filter(threshold == th)
+  
+  for (metric_label in names(metrics_map)) {
+    col_name <- metrics_map[[metric_label]]
+    
+    # 病気データ(disease)と説明変数がともにNAでない行を抽出
+    valid_data <- df_sub %>% 
+      filter(!is.na(disease) & !is.na(.data[[col_name]]))
+    
+    # データ数が3点未満、または説明変数の分散が0（全地点0など）の場合は計算不可
+    if (nrow(valid_data) < 3 || var(valid_data[[col_name]]) == 0) {
+      r2_val   <- NA_real_
+      rmse_val <- NA_real_
+    } else {
+      # 単回帰分析: disease ~ 説明変数
+      formula_obj <- as.formula(paste("disease ~", col_name))
+      fit <- lm(formula_obj, data = valid_data)
+      
+      # R2 (決定係数) の取得
+      r2_val <- summary(fit)$r.squared
+      
+      # RMSE (二乗平均平方根誤差) の算出
+      preds <- predict(fit)
+      rmse_val <- sqrt(mean((valid_data$disease - preds)^2))
+    }
+    
+    regression_results[[length(regression_results) + 1]] <- data.frame(
+      時期     = "生育初期(播種〜V2)",
+      閾値     = paste0(gsub("SMC_", "", th), "%"),
+      説明変数 = metric_label,
+      R2       = round(r2_val, 4),
+      RMSE     = round(rmse_val, 4)
+    )
+  }
+}
+
+# 3. 結果のデータフレーム化 & 表示
+final_table_early <- bind_rows(regression_results)
+
+# 画面にコンソール出力（表形式）
+print(final_table_early, row.names = FALSE)
+
+# 4. 結果を CSV ファイルとして保存（Excel用）
+file_early_reg <- paste0(output_dir, "regression_results_early_stage.csv")
+write.csv(final_table_early, file_early_reg, row.names = FALSE, fileEncoding = "CP932")
+
+cat("\n【分析完了】初期（播種〜V2）の回帰結果を保存しました:\n", file_early_reg, "\n")
+#他の時期はfilter(period == "1_初期(播種-V2)")の部分を置き換えること
