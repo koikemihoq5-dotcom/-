@@ -1,0 +1,138 @@
+# =========================================================
+# 0. パッケージ読み込み & パラメーター設定
+# =========================================================
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+
+# ファイルパス設定
+dir_path            <- "C:/Users/koike/OneDrive/Desktop/Water/"
+file_vstage         <- paste0(dir_path, "2025Vstage.csv")
+file_soil_moisture  <- paste0(dir_path, "soil_moisture_pred_3years_6to9.csv")
+file_output_results <- paste0(dir_path, "seeding_to_v2_wetness_results.csv")
+
+# 計算パラメーター
+threshold_smc <- 0.30  # SMC 30% 以上を帯水と定義
+
+
+# =========================================================
+# 1. データ読み込み & ステージ・病気データの準備
+# =========================================================
+# 生データの読み込み
+df_v_raw <- read.csv(file_vstage, stringsAsFactors = FALSE)
+
+# A. 病気データ (df_disease)
+df_disease <- df_v_raw %>%
+  select(site = name, disease) %>%
+  filter(!is.na(disease))
+
+# B. ステージ縦持ちデータ (V0729 は除外)
+df_v_long <- df_v_raw %>%
+  select(site = name, V_0708, V0713, V0722) %>%
+  pivot_longer(
+    cols = c(V_0708, V0713, V0722),
+    names_to = "date_str",
+    values_to = "stage_val"
+  ) %>%
+  mutate(
+    stage_val = as.numeric(stage_val),
+    date = case_when(
+      date_str == "V_0708" ~ as.Date("2025-07-08"),
+      date_str == "V0713"  ~ as.Date("2025-07-13"),
+      date_str == "V0722"  ~ as.Date("2025-07-22")
+    )
+  ) %>%
+  filter(!is.na(stage_val))
+
+
+# =========================================================
+# 2. 地点ごとに 播種日(Stage=0) と V2到達日(Stage=2) を予測
+# =========================================================
+calc_crop_dates <- function(df_site) {
+  if (nrow(df_site) < 2) return(data.frame(seeding_date = as.Date(NA), v2_date = as.Date(NA)))
+  
+  df_site$day_num <- as.numeric(df_site$date - as.Date("2025-06-01"))
+  fit <- lm(stage_val ~ day_num, data = df_site)
+  
+  a <- coef(fit)["day_num"]
+  b <- coef(fit)[1]
+  
+  if (is.na(a) || a == 0) return(data.frame(seeding_date = as.Date(NA), v2_date = as.Date(NA)))
+  
+  # Stage = 0 (播種日) / Stage = 2 (V2到達日) の逆算
+  seeding_day_num <- (0 - b) / a
+  v2_day_num      <- (2 - b) / a
+  
+  seeding_date <- as.Date("2025-06-01") + round(seeding_day_num)
+  v2_date      <- as.Date("2025-06-01") + round(v2_day_num)
+  
+  return(data.frame(seeding_date = seeding_date, v2_date = v2_date))
+}
+
+# 全地点の重要日付テーブル作成
+crop_dates_df <- df_v_long %>%
+  group_by(site) %>%
+  summarise(calc_crop_dates(pick(everything())), .groups = "drop")
+
+
+# =========================================================
+# 3. 予測播種日 〜 予測V2到達日 の帯水指標を計算
+# =========================================================
+# 土壌水分予測データ（2025年分）の準備
+df_pred_2025 <- read.csv(file_soil_moisture, stringsAsFactors = FALSE) %>%
+  mutate(date = as.Date(date)) %>%
+  filter(year(date) == 2025)
+
+# 各地点の 播種日 〜 V2 期間の帯水指標集計
+df_seeding_to_v2_wetness <- df_pred_2025 %>%
+  inner_join(crop_dates_df, by = "site") %>%
+  filter(date >= seeding_date & date <= v2_date) %>%
+  group_by(site) %>%
+  summarise(
+    seeding_date = first(seeding_date),
+    v2_date_est  = first(v2_date),
+    period_days  = n(),
+    mean_smc     = mean(SMC_pred, na.rm = TRUE),
+    
+    # SMC 30% 以上の最大連続帯水日数
+    max_cont_wet_days = {
+      is_wet <- SMC_pred >= threshold_smc
+      rl <- rle(is_wet)
+      if (any(rl$values)) max(rl$lengths[rl$values]) else 0
+    },
+    
+    # SMC 30% 以上の合計帯水日数
+    total_wet_days = sum(SMC_pred >= threshold_smc, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+# 計算結果を CSV 保存
+write.csv(df_seeding_to_v2_wetness, file_output_results, row.names = FALSE)
+
+
+# =========================================================
+# 4. 病気データと結合して単回帰分析 & 散布図描画
+# =========================================================
+# データ結合
+df_analysis <- inner_join(df_disease, df_seeding_to_v2_wetness, by = "site")
+
+# 単回帰分析
+model_v2 <- lm(disease ~ max_cont_wet_days, data = df_analysis)
+cat("\n--- 単回帰分析結果 ---\n")
+print(summary(model_v2))
+
+# 散布図の描画
+p <- ggplot(df_analysis, aes(x = max_cont_wet_days, y = disease)) +
+  geom_point(size = 3, color = "royalblue", alpha = 0.7) +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  labs(
+    title = "実測直線回帰による播種〜V2期推定と黒根腐れ病発生率",
+    x = "播種〜V2期における最大連続帯水日数 (SMC ≥ 30%)",
+    y = "黒根腐れ病 発生率 (%)"
+  ) +
+  theme_minimal(base_size = 12)
+
+# グラフ表示
+print(p)
