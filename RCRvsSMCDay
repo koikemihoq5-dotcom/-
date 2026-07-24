@@ -49,31 +49,104 @@ df_v_long <- df_v_raw %>%
 # =========================================================
 # 2. 地点ごとに 播種日(Stage=0) と V2到達日(Stage=2) を予測
 # =========================================================
-calc_crop_dates <- function(df_site) {
-  if (nrow(df_site) < 2) return(data.frame(seeding_date = as.Date(NA), v2_date = as.Date(NA)))
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+# 1. データの読み込み
+output_dir <- "C:/Users/koike/OneDrive/Desktop/Water/Use/"
+df_v_raw <- read.csv(paste0(output_dir, "2025Vstage.csv"), stringsAsFactors = FALSE)
+
+# 2. 縦持ち変換（mutate 内に across を修正）
+df_v_long <- df_v_raw %>%
+  mutate(
+    across(c(V_0708, V0713, V0722, V0729), as.character)
+  ) %>%
+  pivot_longer(
+    cols = c(V_0708, V0713, V0722, V0729),
+    names_to = "date_str",
+    values_to = "stage_val"
+  ) %>%
+  mutate(
+    obs_date = case_when(
+      date_str == "V_0708" ~ as.Date("2025-07-08"),
+      date_str == "V0713"  ~ as.Date("2025-07-13"),
+      date_str == "V0722"  ~ as.Date("2025-07-22"),
+      date_str == "V0729"  ~ as.Date("2025-07-29")
+    )
+  )
+
+# 3. 観測データから「播種日」と「各ステージ到達日」を予測する関数
+estimate_dates_from_v <- function(df_site) {
+  # 数値ステージのみ抽出
+  df_num <- df_site %>%
+    mutate(stage_num = suppressWarnings(as.numeric(stage_val))) %>%
+    filter(!is.na(stage_num))
   
-  df_site$day_num <- as.numeric(df_site$date - as.Date("2025-06-01"))
-  fit <- lm(stage_val ~ day_num, data = df_site)
+  if (nrow(df_num) < 2) {
+    return(data.frame(
+      pred_seeding_date = as.Date(NA),
+      v2_date = as.Date(NA), v5_date = as.Date(NA), r1_date = as.Date(NA)
+    ))
+  }
   
-  a <- coef(fit)["day_num"]
+  # 観測日を日付数値に変換して回帰分析 ( Stage = a * Date + b )
+  fit <- lm(stage_num ~ obs_date, data = df_num)
+  a <- coef(fit)["obs_date"]  # 1日あたりの成長節数
   b <- coef(fit)[1]
   
-  if (is.na(a) || a == 0) return(data.frame(seeding_date = as.Date(NA), v2_date = as.Date(NA)))
+  if (is.na(a) || a <= 0) {
+    return(data.frame(
+      pred_seeding_date = as.Date(NA),
+      v2_date = as.Date(NA), v5_date = as.Date(NA), r1_date = as.Date(NA)
+    ))
+  }
   
-  # Stage = 0 (播種日) / Stage = 2 (V2到達日) の逆算
-  seeding_day_num <- (0 - b) / a
-  v2_day_num      <- (2 - b) / a
+  # Stage = 0 (出芽・節開始) となる日付
+  v0_date <- as.Date(round((0 - b) / a), origin = "1970-01-01")
   
-  seeding_date <- as.Date("2025-06-01") + round(seeding_day_num)
-  v2_date      <- as.Date("2025-06-01") + round(v2_day_num)
+  # ★播種日の予測: V0到達の約6日前（発芽・吸水期間）と推定
+  pred_seeding_date <- v0_date - 6
   
-  return(data.frame(seeding_date = seeding_date, v2_date = v2_date))
+  # V2, V5 到達日の予測
+  # 実測でV2がある場合はその観測日を優先、無ければ回帰から算出
+  v2_row <- df_site %>% filter(stage_val == "2")
+  if (nrow(v2_row) > 0) {
+    v2_date <- v2_row$obs_date[1]
+  } else {
+    v2_date <- as.Date(round((2 - b) / a), origin = "1970-01-01")
+  }
+  
+  v5_date <- as.Date(round((5 - b) / a), origin = "1970-01-01")
+  
+  # R1 到達日: "R1" 記載があればその日、無ければ Stage=10 相当
+  r1_row <- df_site %>% filter(stage_val == "R1")
+  if (nrow(r1_row) > 0) {
+    r1_date <- r1_row$obs_date[1]
+  } else {
+    r1_date <- as.Date(round((10 - b) / a), origin = "1970-01-01")
+  }
+  
+  return(data.frame(
+    pred_seeding_date = pred_seeding_date,
+    v2_date = v2_date,
+    v5_date = v5_date,
+    r1_date = r1_date
+  ))
 }
 
-# 全地点の重要日付テーブル作成
-crop_dates_df <- df_v_long %>%
-  group_by(site) %>%
-  summarise(calc_crop_dates(pick(everything())), .groups = "drop")
+# 4. 全地点で播種日とステージ到達日を予測
+crop_stages_predicted <- df_v_long %>%
+  group_by(site = name) %>%
+  group_modify(~ estimate_dates_from_v(.x)) %>%
+  ungroup()
+
+# 5. 確認 & CSV保存
+head(crop_stages_predicted, 15)
+
+file_pred_stages <- paste0(output_dir, "crop_stages_predicted.csv")
+write.csv(crop_stages_predicted, file_pred_stages, row.names = FALSE, fileEncoding = "CP932")
+cat("\n【観測データからの予測版】ステージデータを保存しました:\n", file_pred_stages, "\n")
 
 
 # =========================================================
