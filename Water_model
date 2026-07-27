@@ -265,31 +265,42 @@ write.csv(
 cat("\n🎉 4年分の最適化が正常に完了し、デスクトップの Water フォルダにCSV結果を保存しました！\n")
 
 # =========================================================
-# 2025年 栽培期間（6/1〜9/30）の土壌水分 推定処理
-# データのない部分も推定して補完し、毎日のデータに変える。
+# 4年分 栽培期間（6/1〜9/30）の土壌水分 一括推定処理
+# 実測のない日も補完し、4年分の全日連続データを作成
 # =========================================================
 
-# 1. 2025年栽培期間の気象データを抽出（日付型を明示して安全に抽出）
-df_weather_2025_full <- subset(
-  df_weather, 
-  date >= as.Date("2025-06-01") & date <= as.Date("2025-09-30")
-)
+library(dplyr)
+library(lubridate)
 
-# 2. 全地点の2025年全日推定結果を格納するデータフレーム
-df_pred_2025_all <- data.frame()
+# 1. 4年分（2023, 2024, 2025, 2026）の 6/1 〜 9/30 の気象データを抽出
+# ※ 9/1 までにしたい場合は "09-01" に変更してください
+df_weather_4years_season <- df_weather %>%
+  mutate(
+    date = as.Date(date),
+    yr   = year(date),
+    mon  = month(date)
+  ) %>%
+  filter(
+    yr %in% c(2023, 2024, 2025, 2026) & 
+    ((mon == 6) | (mon == 7) | (mon == 8) | (mon == 9))
+  )
 
-# 3. 全地点ループで全日推定を実行
-cat("2025年栽培期間（6/1〜9/30）の全日土壌水分量を推定中...\n")
+# 2. 全地点・全年の推定結果を格納するデータフレーム
+df_pred_4years_all <- data.frame()
 
+cat("4年分（2023〜2026年）栽培期間の全日土壌水分量を推定中...\n")
+
+# 3. 全地点ループで一括推定
 for (s in sites) {
   # 地点ごとの最適化パラメータを取得
   pars_target <- subset(summary_params, site == s)
   
   # 該当パラメータが存在する場合のみ実行
   if (nrow(pars_target) > 0) {
-    # 2025年栽培期間で水収支シミュレーションを実行
+    
+    # 4年分の該当期間気象データで水収支シミュレーションを実行
     sim_full <- simulate_water(
-      df_weather_2025_full, 
+      df_weather_4years_season, 
       a    = pars_target$a, 
       AWHC = pars_target$AWHC
     )
@@ -306,26 +317,29 @@ for (s in sites) {
     
     # 必要な列（date, site, rain, et_p, SMC_pred）だけ抽出して結合
     sim_sub <- sim_full[, c("date", "site", "rain", "et_p", "SMC_pred")]
-    df_pred_2025_all <- rbind(df_pred_2025_all, sim_sub)
+    df_pred_4years_all <- rbind(df_pred_4years_all, sim_sub)
   }
 }
 
 # --- 4. 結果の確認 ---
-print("【2025年栽培期間 推定結果（先頭6行）】")
-print(head(df_pred_2025_all))
+print("【4年分 栽培期間 推定結果（先頭10行）】")
+print(head(df_pred_4years_all, 10))
+
+cat("\n【年度ごとの出力データ件数チェック】\n")
+print(table(year(df_pred_4years_all$date)))
 
 # --- 5. 推定結果をデスクトップの Water フォルダにCSV保存 ---
-save_path <- "C:/Users/koike/OneDrive/Desktop/Water/soil_moisture_pred_2025_full.csv"
+save_path <- "C:/Users/koike/OneDrive/Desktop/Water/soil_moisture_pred_4years_full.csv"
 
 write.csv(
-  df_pred_2025_all, 
+  df_pred_4years_all, 
   file = save_path, 
   row.names = FALSE, 
   fileEncoding = "CP932"
 )
 
-cat("\n🎉 2025年栽培期間の推定結果を以下のパスに保存しました！\n")
-cat(save_path, "\n")
+cat("\n🎉 4年分（2023〜2026年）の全日推定結果を保存しました！\n")
+cat("保存先:", save_path, "\n")
 
 # =========================================================
 # 2023〜2025年 適合度（再現精度）の評価処理
