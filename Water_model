@@ -69,6 +69,9 @@ colnames(df_weather) <- c("date", "rain", "et_p")
 # --- 結果の確認 ---
 head(df_weather)
 
+# csvコードへの保存
+write.csv(df_weather, file = "df_weather.csv", row.names = FALSE)
+
 # =========================================================
 # 実測データ2025Water.csv の整形処理コード
 # =========================================================
