@@ -125,14 +125,60 @@ write.csv(
 )
 
 # =========================================================
-# 3年分データ（SMC_3years）パラメータ最適化 実行コード
+# 4年分データ（2023〜2026年）パラメータ最適化 一括実行コード
 # =========================================================
 
-# 1. 念のため日付型を確実に統一
-df_weather$date <- as.Date(df_weather$date)
-SMC_3years$date <- as.Date(SMC_3years$date)
+library(dplyr)
+library(lubridate)
 
+# ---------------------------------------------------------
+# 1. 4年分のCSVを読み込み＆安全に結合する関数
+# ---------------------------------------------------------
+# 型ズレ（site列が数値と文字）や日付表記の違いを自動で整形
+clean_and_prep <- function(df) {
+  df %>%
+    rename_with(tolower) %>%
+    mutate(
+      # 日付を柔軟に解析して Date 型に統一
+      date = as.Date(parse_date_time(date, orders = c("Ymd", "Y/m/d", "Y-m-d"))),
+      # site列を文字列型に統一（型混在エラーの防止）
+      site = as.character(site),
+      # SMC_obs を数値型に統一
+      smc_obs = as.numeric(smc_obs)
+    ) %>%
+    select(date, site, smc_obs) %>%
+    rename(SMC_obs = smc_obs) %>%
+    filter(!is.na(SMC_obs) & !is.na(date))
+}
+
+# データの読み込み（すでに読み込まれている場合はそのまま使います）
+if (!exists("smc_obs_cleaned2023")) {
+  smc_obs_cleaned2023 <- read.csv("C:/Users/koike/OneDrive/Desktop/Water/3Data_Change/smc_obs_cleaned2023.csv", stringsAsFactors = FALSE)
+  smc_obs_cleaned2024 <- read.csv("C:/Users/koike/OneDrive/Desktop/Water/3Data_Change/smc_obs_cleaned2024.csv", stringsAsFactors = FALSE)
+  smc_obs_cleaned2025 <- read.csv("C:/Users/koike/OneDrive/Desktop/Water/3Data_Change/smc_obs_cleaned2025.csv", stringsAsFactors = FALSE)
+  smc_obs_cleaned2026 <- read.csv("C:/Users/koike/OneDrive/Desktop/Water/3Data_Change/smc_obs_cleaned2026.csv", stringsAsFactors = FALSE)
+}
+
+# 4年分のデータを安全に統合して SMC_4years を作成
+SMC_4years <- bind_rows(
+  clean_and_prep(smc_obs_cleaned2023),
+  clean_and_prep(smc_obs_cleaned2024),
+  clean_and_prep(smc_obs_cleaned2025),
+  clean_and_prep(smc_obs_cleaned2026)
+) %>%
+  distinct() %>%
+  arrange(site, date)
+
+# 気象データの日付型も確実に統一
+df_weather$date <- as.Date(df_weather$date)
+
+cat("--- データ統合完了 ---\n")
+cat("全データ件数:", nrow(SMC_4years), "件\n")
+cat("対象年度:", unique(format(SMC_4years$date, "%Y")), "\n")
+
+# ---------------------------------------------------------
 # 2. 安定版最適化関数の定義
+# ---------------------------------------------------------
 estimate_parameters_stable <- function(df_weather, df_obs_smc, 
                                        fixed_a = 0.5, fixed_AWHC = 40.0,
                                        init_params = c(Sd = 200, SMC0 = 0.05)) {
@@ -164,14 +210,16 @@ estimate_parameters_stable <- function(df_weather, df_obs_smc,
   return(opt)
 }
 
+# ---------------------------------------------------------
 # 3. 全地点一括最適化ループ
-sites <- unique(SMC_3years$site)
+# ---------------------------------------------------------
+sites <- unique(SMC_4years$site)
 summary_params <- data.frame()
 
-cat("全", length(sites), "地点の最適化計算を実行中...\n")
+cat("\n全", length(sites), "地点の最適化計算を実行中...\n")
 
 for (s in sites) {
-  df_obs_site <- subset(SMC_3years, site == s)
+  df_obs_site <- subset(SMC_4years, site == s)
   
   opt_out <- estimate_parameters_stable(
     df_weather  = df_weather, 
@@ -192,19 +240,29 @@ for (s in sites) {
   ))
 }
 
-# 4. 推定された地点別パラメータ一覧の表示
-print("【3年分一括：地点別 最適化パラメータ結果一覧】")
+# ---------------------------------------------------------
+# 4. 推定結果の表示とCSV保存
+# ---------------------------------------------------------
+print("【4年分一括：地点別 最適化パラメータ結果一覧（先頭10地点）】")
 print(head(summary_params, 10))
 
-# 5. CSV保存
+# 4年分統合実測データの保存
 write.csv(
-  summary_params, 
-  "C:/Users/koike/OneDrive/Desktop/Water/optimization_results_3years.csv", 
+  SMC_4years, 
+  "C:/Users/koike/OneDrive/Desktop/Water/SMC_4years.csv", 
   row.names = FALSE, 
   fileEncoding = "CP932"
 )
 
-cat("\n🎉 最適化が正常に完了し、CSVに結果を保存しました！\n")
+# 最適化結果の保存
+write.csv(
+  summary_params, 
+  "C:/Users/koike/OneDrive/Desktop/Water/optimization_results_4years.csv", 
+  row.names = FALSE, 
+  fileEncoding = "CP932"
+)
+
+cat("\n🎉 4年分の最適化が正常に完了し、デスクトップの Water フォルダにCSV結果を保存しました！\n")
 
 # =========================================================
 # 2025年 栽培期間（6/1〜9/30）の土壌水分 推定処理
