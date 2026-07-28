@@ -1,0 +1,64 @@
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+# =========================================================
+# 1. 地点ごとに 播種日(Stage=0) と V2到達日(Stage=2) を予測 (2024年版)
+# =========================================================
+
+# ステージデータの読み込み
+df_v_raw <- read.csv("C:/Users/koike/OneDrive/Desktop/Water/UnUse/2024Vstage.csv", stringsAsFactors = FALSE)
+
+# 縦持ち変換
+df_v_long <- df_v_raw %>%
+  # Vで始まる列（V_0722, V_0810 など）と name 列を選択
+  select(site = name, matches("^V_?\\d+")) %>%
+  # 型の違い（integerとcharacter）を無視して強制的にまとめてから数値化する
+  pivot_longer(
+    cols = -site,
+    names_to = "date_str",
+    values_to = "stage_val",
+    values_transform = list(stage_val = as.character) # ★ここを追加して型エラーを回避
+  ) %>%
+  mutate(
+    stage_val = as.numeric(stage_val), # ここで数値に変換（数値化できない文字は自動的にNAになります）
+    clean_md  = gsub("[^0-9]", "", date_str), # 数字のみ抽出 (例: "0722")
+    date      = as.Date(paste0("2024-", substr(clean_md, 1, 2), "-", substr(clean_md, 3, 4)))
+  ) %>%
+  filter(!is.na(stage_val))
+
+# 日付予測用の関数 (2024-06-01 起算)
+calc_crop_dates <- function(df_site) {
+  if (nrow(df_site) < 2) return(data.frame(seeding_date = as.Date(NA), v2_date = as.Date(NA)))
+  
+  df_site$day_num <- as.numeric(df_site$date - as.Date("2024-06-01"))
+  fit <- lm(stage_val ~ day_num, data = df_site)
+  
+  a <- coef(fit)["day_num"]
+  b <- coef(fit)[1]
+  
+  if (is.na(a) || a == 0) return(data.frame(seeding_date = as.Date(NA), v2_date = as.Date(NA)))
+  
+  # Stage = 0 (播種日) と Stage = 2 (V2到達日) の逆算
+  seeding_day_num <- (0 - b) / a
+  v2_day_num      <- (2 - b) / a
+  
+  seeding_date <- as.Date("2024-06-01") + round(seeding_day_num)
+  v2_date      <- as.Date("2024-06-01") + round(v2_day_num)
+  
+  return(data.frame(seeding_date = seeding_date, v2_date = v2_date))
+}
+
+# 予測実行
+crop_dates_df <- df_v_long %>%
+  group_by(site) %>%
+  summarise(calc_crop_dates(pick(everything())), .groups = "drop")
+
+seeding_dates_df <- crop_dates_df %>% select(site, seeding_date)
+v2_results       <- crop_dates_df %>% select(site, v2_date)
+
+# 結果の確認
+head(crop_dates_df)
+
+# CSVファイルとして保存（文字化けを防ぐため UTF-8 を指定）
+write.csv(crop_dates_df, "C:/Users/koike/OneDrive/Desktop/Water/2024_crop_dates_predicted.csv", row.names = FALSE, fileEncoding = "UTF-8")
