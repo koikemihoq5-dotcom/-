@@ -13,16 +13,15 @@ df_v_raw <- read.csv("C:/Users/koike/OneDrive/Desktop/Water/UnUse/2024Vstage.csv
 df_v_long <- df_v_raw %>%
   # Vで始まる列（V_0722, V_0810 など）と name 列を選択
   select(site = name, matches("^V_?\\d+")) %>%
-  # 型の違い（integerとcharacter）を無視して強制的にまとめてから数値化する
   pivot_longer(
     cols = -site,
     names_to = "date_str",
     values_to = "stage_val",
-    values_transform = list(stage_val = as.character) # ★ここを追加して型エラーを回避
+    values_transform = list(stage_val = as.character)
   ) %>%
   mutate(
-    stage_val = as.numeric(stage_val), # ここで数値に変換（数値化できない文字は自動的にNAになります）
-    clean_md  = gsub("[^0-9]", "", date_str), # 数字のみ抽出 (例: "0722")
+    stage_val = as.numeric(stage_val),
+    clean_md  = gsub("[^0-9]", "", date_str),
     date      = as.Date(paste0("2024-", substr(clean_md, 1, 2), "-", substr(clean_md, 3, 4)))
   ) %>%
   filter(!is.na(stage_val))
@@ -37,7 +36,10 @@ calc_crop_dates <- function(df_site) {
   a <- coef(fit)["day_num"]
   b <- coef(fit)[1]
   
-  if (is.na(a) || a == 0) return(data.frame(seeding_date = as.Date(NA), v2_date = as.Date(NA)))
+  # ★ 傾き a が NA や 0 以下の場合は一旦 NA を返す（巨大数値を防止）
+  if (is.na(a) || a <= 0.001) {
+    return(data.frame(seeding_date = as.Date(NA), v2_date = as.Date(NA)))
+  }
   
   # Stage = 0 (播種日) と Stage = 2 (V2到達日) の逆算
   seeding_day_num <- (0 - b) / a
@@ -49,16 +51,34 @@ calc_crop_dates <- function(df_site) {
   return(data.frame(seeding_date = seeding_date, v2_date = v2_date))
 }
 
-# 予測実行
+# 一旦通常通り計算 (異常値の地点は seeding_date / v2_date が NA になる)
 crop_dates_df <- df_v_long %>%
   group_by(site) %>%
   summarise(calc_crop_dates(pick(everything())), .groups = "drop")
 
+# =========================================================
+# 2. NA（計算不能地点）を「他地点の平均日付」で補完
+# =========================================================
+
+# 正常に計算できた地点の平均日付を算出
+mean_seeding <- mean(crop_dates_df$seeding_date, na.rm = TRUE)
+mean_v2      <- mean(crop_dates_df$v2_date, na.rm = TRUE)
+
+# NAとなっている地点を平均日付で置き換え (四捨五入してきれいな日付にする)
+crop_dates_df <- crop_dates_df %>%
+  mutate(
+    seeding_date = if_else(is.na(seeding_date), round(mean_seeding), seeding_date),
+    v2_date      = if_else(is.na(v2_date), round(mean_v2), v2_date)
+  )
+
+# 後続処理用のデータフレームを更新
 seeding_dates_df <- crop_dates_df %>% select(site, seeding_date)
 v2_results       <- crop_dates_df %>% select(site, v2_date)
 
 # 結果の確認
 head(crop_dates_df)
 
-# CSVファイルとして保存（文字化けを防ぐため UTF-8 を指定）
+# =========================================================
+# 3. CSVファイルとして保存
+# =========================================================
 write.csv(crop_dates_df, "C:/Users/koike/OneDrive/Desktop/Water/2024_crop_dates_predicted.csv", row.names = FALSE, fileEncoding = "UTF-8")
